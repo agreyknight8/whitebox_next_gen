@@ -3610,12 +3610,6 @@ fn build_lidar_output(
     crs: CrsInfo,
     data_type: DataType,
 ) -> Result<Raster, ToolError> {
-    if !cell_size.is_finite() || cell_size <= 0.0 {
-        return Err(ToolError::Validation(
-            "resolution/cell_size must be a positive finite value".to_string(),
-        ));
-    }
-
     let min_x = samples
         .iter()
         .map(|(x, _, _)| *x)
@@ -3632,23 +3626,7 @@ fn build_lidar_output(
         .iter()
         .map(|(_, y, _)| *y)
         .fold(f64::NEG_INFINITY, f64::max);
-
-    let cols = (((max_x - min_x) / cell_size).ceil() as usize).max(1);
-    let rows = (((max_y - min_y) / cell_size).ceil() as usize).max(1);
-
-    Ok(Raster::new(RasterConfig {
-        cols,
-        rows,
-        bands: 1,
-        x_min: min_x,
-        y_min: max_y - rows as f64 * cell_size,
-        cell_size,
-        cell_size_y: Some(cell_size),
-        nodata: -32768.0,
-        data_type,
-        crs,
-        metadata: Vec::new(),
-    }))
+    build_lidar_output_from_bounds(min_x, max_x, min_y, max_y, cell_size, crs, data_type)
 }
 
 fn build_lidar_output_from_bounds(
@@ -3665,14 +3643,17 @@ fn build_lidar_output_from_bounds(
             "resolution/cell_size must be a positive finite value".to_string(),
         ));
     }
-    let cols = (((max_x - min_x) / cell_size).ceil() as usize).max(1);
-    let rows = (((max_y - min_y) / cell_size).ceil() as usize).max(1);
+    // Corners on whole multiples of the cell size, so tiles gridded separately line up cell for cell.
+    let x_min = (min_x / cell_size).floor() * cell_size;
+    let y_max = (max_y / cell_size).ceil() * cell_size;
+    let cols = (((max_x - x_min) / cell_size).ceil() as usize).max(1);
+    let rows = (((y_max - min_y) / cell_size).ceil() as usize).max(1);
     Ok(Raster::new(RasterConfig {
         cols,
         rows,
         bands: 1,
-        x_min: min_x,
-        y_min: max_y - rows as f64 * cell_size,
+        x_min,
+        y_min: y_max - rows as f64 * cell_size,
         cell_size,
         cell_size_y: Some(cell_size),
         nodata: -32768.0,
@@ -16437,6 +16418,26 @@ mod tests {
             progress: &PROGRESS,
             capabilities: &CAPS,
         }
+    }
+
+    #[test]
+    fn lidar_output_grid_snaps_to_cell_multiples_and_covers_samples() {
+        let samples = [(308524.81, 631453.64, 0.0), (309006.31, 632120.34, 0.0)];
+        let r = build_lidar_output(&samples, 0.5, CrsInfo::default(), DataType::F64).unwrap();
+        assert_eq!(r.x_min, 308524.5);
+        assert_eq!(r.y_max(), 632120.5);
+        assert_eq!((r.cols, r.rows), (964, 1334));
+        assert!(r.x_max() >= 309006.31 && r.y_min <= 631453.64);
+    }
+
+    #[test]
+    fn lidar_output_grid_from_bounds_snaps_too() {
+        let r = build_lidar_output_from_bounds(
+            10.3, 20.2, 5.1, 9.9, 1.0, CrsInfo::default(), DataType::F64,
+        )
+        .unwrap();
+        assert_eq!((r.x_min, r.y_max()), (10.0, 10.0));
+        assert_eq!((r.cols, r.rows), (11, 5));
     }
 
     fn make_test_point_cloud() -> PointCloud {

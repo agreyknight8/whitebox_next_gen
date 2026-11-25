@@ -7049,7 +7049,7 @@ fn lidar_rbf_poly_order_quadratic_is_functional() {
         "input".to_string(),
         json!({"__wbw_type__":"lidar","path": lidar_path.to_string_lossy().to_string()}),
     );
-    none_args.insert("resolution".to_string(), json!(2.0));
+    none_args.insert("resolution".to_string(), json!(0.5));
     none_args.insert("num_points".to_string(), json!(6));
     none_args.insert("func_type".to_string(), json!("gaussian"));
     none_args.insert("weight".to_string(), json!(0.2));
@@ -7082,13 +7082,18 @@ fn lidar_rbf_poly_order_quadratic_is_functional() {
 
     let none_raster = Raster::read(&none_out).expect("read none output");
     let quad_raster = Raster::read(&quad_out).expect("read quadratic output");
-    let none_v = none_raster.get(0, 0, 0);
-    let quad_v = quad_raster.get(0, 0, 0);
-    let expected = 3.0;
+    // Sample a cell centre away from every input point; the inputs lie on
+    // z = 3 + 2x - y + 0.5x^2 + 0.25xy + 0.75y^2, which gives 2.3125 at (-0.25, 0.25).
+    let (col, row) = none_raster
+        .world_to_pixel(-0.25, 0.25)
+        .expect("sample point inside the grid");
+    let none_v = none_raster.get(0, row, col);
+    let quad_v = quad_raster.get(0, row, col);
+    let expected = 2.3125;
 
     assert!(
         (quad_v - expected).abs() < (none_v - expected).abs(),
-        "poly_order=quadratic should improve the estimate at origin: none={none_v}, quad={quad_v}, expected={expected}"
+        "poly_order=quadratic should improve the estimate at (-0.25, 0.25): none={none_v}, quad={quad_v}, expected={expected}"
     );
 
     let _ = std::fs::remove_file(&lidar_path);
