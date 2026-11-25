@@ -4709,6 +4709,40 @@ fn wkt_vertical_us_foot_uses_foot_unit() {
 }
 
 #[test]
+fn wkt_projected_us_foot_uses_foot_unit_and_authority() {
+    let esri = to_esri_wkt(6527).unwrap();
+    let ogc = to_ogc_wkt(6527).unwrap();
+    assert!(esri.ends_with("UNIT[\"Foot_US\",0.3048006096012192]]"), "{esri}");
+    assert!(
+        ogc.ends_with("UNIT[\"US survey foot\",0.3048006096012192],AUTHORITY[\"EPSG\",\"6527\"]]"),
+        "{ogc}"
+    );
+    assert_eq!(epsg_from_wkt(&ogc), Some(6527));
+}
+
+#[test]
+fn wkt_projected_international_foot_uses_foot_unit() {
+    let esri = to_esri_wkt(6405).unwrap();
+    let ogc = to_ogc_wkt(6405).unwrap();
+    assert!(esri.ends_with("UNIT[\"Foot\",0.3048]]"), "{esri}");
+    assert!(ogc.ends_with("UNIT[\"foot\",0.3048],AUTHORITY[\"EPSG\",\"6405\"]]"), "{ogc}");
+}
+
+#[test]
+fn wkt_projected_metre_keeps_metre_unit() {
+    let ogc = to_ogc_wkt(6526).unwrap();
+    assert!(ogc.ends_with("UNIT[\"metre\",1.0],AUTHORITY[\"EPSG\",\"6526\"]]"), "{ogc}");
+}
+
+#[test]
+fn from_wkt_round_trips_exported_us_foot_state_plane() {
+    let crs = from_wkt(&to_ogc_wkt(6527).unwrap()).unwrap();
+    let (x, y) = crs.forward(-74.5, 40.0).unwrap();
+    let (ex, ey) = Crs::from_epsg(6527).unwrap().forward(-74.5, 40.0).unwrap();
+    assert!((x - ex).abs() < 0.01 && (y - ey).abs() < 0.01, "got ({x}, {y}), expected ({ex}, {ey})");
+}
+
+#[test]
 fn wkt_swiss_codes_use_oblique_stereographic_method_name() {
     let esri = to_esri_wkt(2056).unwrap();
     let ogc = to_ogc_wkt(21781).unwrap();

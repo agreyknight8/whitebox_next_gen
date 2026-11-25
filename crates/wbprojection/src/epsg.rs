@@ -2424,7 +2424,7 @@ pub fn to_esri_wkt(code: u32) -> Result<String> {
 
     if is_vertical_epsg(code) {
         let (axis_name, axis_dir) = vertical_axis_spec(code);
-        let (unit_name, unit_scale) = vertical_wkt_unit(code, true);
+        let (unit_name, unit_scale) = wkt_linear_unit(code, true);
         return Ok(format!(
             "VERT_CS[\"{}\",VERT_DATUM[\"{}\",2005],UNIT[\"{}\",{}],AXIS[\"{}\",{}]]",
             projcs_name, datum.name, unit_name, unit_scale, axis_name, axis_dir
@@ -2446,7 +2446,8 @@ pub fn to_esri_wkt(code: u32) -> Result<String> {
     for (k, v) in params_list {
         wkt.push_str(&format!(",PARAMETER[\"{}\",{:.12}]", k, v));
     }
-    wkt.push_str(",UNIT[\"Meter\",1.0]]");
+    let (unit_name, unit_scale) = wkt_linear_unit(code, true);
+    wkt.push_str(&format!(",UNIT[\"{}\",{:?}]]", unit_name, unit_scale));
     Ok(wkt)
 }
 
@@ -2490,7 +2491,7 @@ pub fn to_ogc_wkt(code: u32) -> Result<String> {
 
     if is_vertical_epsg(code) {
         let (axis_name, axis_dir) = vertical_axis_spec(code);
-        let (unit_name, unit_scale) = vertical_wkt_unit(code, false);
+        let (unit_name, unit_scale) = wkt_linear_unit(code, false);
         return Ok(format!(
             "VERT_CS[\"{}\",VERT_DATUM[\"{}\",2005],UNIT[\"{}\",{}],AXIS[\"{}\",{}]]",
             projcs_name, datum.name, unit_name, unit_scale, axis_name, axis_dir
@@ -2512,7 +2513,12 @@ pub fn to_ogc_wkt(code: u32) -> Result<String> {
     for (k, v) in params_list {
         wkt.push_str(&format!(",PARAMETER[\"{}\",{:.12}]", k, v));
     }
-    wkt.push_str(",UNIT[\"metre\",1.0]]");
+    // Parameters are stored in the CRS's own unit, so the unit must match it or feet read as metres.
+    let (unit_name, unit_scale) = wkt_linear_unit(code, false);
+    wkt.push_str(&format!(
+        ",UNIT[\"{}\",{:?}],AUTHORITY[\"EPSG\",\"{}\"]]",
+        unit_name, unit_scale, code
+    ));
     Ok(wkt)
 }
 
@@ -3540,7 +3546,7 @@ fn vertical_axis_spec(code: u32) -> (&'static str, &'static str) {
     }
 }
 
-fn vertical_wkt_unit(code: u32, esri: bool) -> (&'static str, f64) {
+fn wkt_linear_unit(code: u32, esri: bool) -> (&'static str, f64) {
     let unit = get_info(code).map(|i| i.unit).unwrap_or("metre");
 
     if unit.eq_ignore_ascii_case("US survey foot") {
@@ -3548,6 +3554,12 @@ fn vertical_wkt_unit(code: u32, esri: bool) -> (&'static str, f64) {
             ("Foot_US", 1200.0 / 3937.0)
         } else {
             ("US survey foot", 1200.0 / 3937.0)
+        }
+    } else if unit.eq_ignore_ascii_case("foot") {
+        if esri {
+            ("Foot", 0.3048)
+        } else {
+            ("foot", 0.3048)
         }
     } else if esri {
         ("Meter", 1.0)
