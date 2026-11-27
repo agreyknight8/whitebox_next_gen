@@ -34289,3 +34289,102 @@ fn k_shortest_paths_network_respects_barrier_points() {
     let _ = std::fs::remove_file(&barriers_path);
     let _ = std::fs::remove_file(&out_path);
 }
+
+/// A 60 x 60 cloud with a noisy ground plane, a flat roof and a scatter of tree points,
+/// made from a fixed linear congruential sequence so every run builds the same points.
+fn classify_lidar_test_cloud() -> PointCloud {
+    let mut state = 12345_u64;
+    let mut next = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut points = Vec::new();
+    for i in 0..60 {
+        for j in 0..60 {
+            let (x, y) = (i as f64 * 0.5, j as f64 * 0.5);
+            let roof = (10.0..20.0).contains(&x) && (10.0..20.0).contains(&y);
+            let z = if roof { 108.0 } else { 100.0 } + (next() - 0.5) * 0.1;
+            points.push(PointRecord { x, y, z, classification: 1, ..PointRecord::default() });
+        }
+    }
+    for _ in 0..1500 {
+        let (x, y) = (22.0 + next() * 7.0, 2.0 + next() * 25.0);
+        let z = 100.0 + next() * 12.0;
+        points.push(PointRecord { x, y, z, classification: 1, ..PointRecord::default() });
+    }
+    // Rooftop clutter: scattered points a little above the middle of the roof.
+    for _ in 0..300 {
+        let (x, y) = (13.0 + next() * 4.0, 13.0 + next() * 4.0);
+        let z = 108.5 + next() * 1.5;
+        points.push(PointRecord { x, y, z, classification: 1, ..PointRecord::default() });
+    }
+    PointCloud { points, crs: Some(LidarCrs::from_epsg(4326)) }
+}
+
+/// Runs classify_lidar on the test cloud with extra settings and returns the classes.
+fn classify_lidar_classes(tag: &str, extra: &[(&str, serde_json::Value)]) -> Vec<u8> {
+    let mut registry = ToolRegistry::new();
+    register_default_tools(&mut registry);
+    let caps = OpenOnly;
+    let tag = unique_tag(tag);
+    let input = std::env::temp_dir().join(format!("{tag}_in.las"));
+    let output = std::env::temp_dir().join(format!("{tag}_out.las"));
+    classify_lidar_test_cloud().write(&input).expect("write input");
+    let mut args = ToolArgs::new();
+    args.insert("input".to_string(), json!(input.to_string_lossy().to_string()));
+    args.insert("output".to_string(), json!(output.to_string_lossy().to_string()));
+    args.insert("search_radius".to_string(), json!(1.5));
+    args.insert("grd_threshold".to_string(), json!(0.2));
+    args.insert("oto_threshold".to_string(), json!(1.0));
+    extra.iter().for_each(|(k, v)| {
+        args.insert(k.to_string(), v.clone());
+    });
+    registry.run("classify_lidar", &args, &context(&caps)).expect("classify_lidar run");
+    let classes = PointCloud::read(&output)
+        .expect("read output")
+        .points
+        .iter()
+        .map(|p| p.classification)
+        .collect();
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+    classes
+}
+
+#[test]
+fn classify_lidar_gives_the_same_classes_on_every_run() {
+    let first = classify_lidar_classes("wbtools_oss_classify_repeat_a", &[]);
+    let runs: Vec<Vec<u8>> = (0..4)
+        .map(|r| classify_lidar_classes(&format!("wbtools_oss_classify_repeat_{r}"), &[]))
+        .collect();
+    assert!(runs.iter().all(|c| *c == first), "classify_lidar output changed between runs");
+}
+
+#[test]
+fn classify_lidar_low_residual_threshold_is_a_setting() {
+    let none = classify_lidar_classes(
+        "wbtools_oss_classify_low_none",
+        &[("low_residual_threshold", json!(-1.0e9))],
+    );
+    let all = classify_lidar_classes(
+        "wbtools_oss_classify_low_all",
+        &[("low_residual_threshold", json!(1.0e9))],
+    );
+    let ones = |c: &[u8]| c.iter().filter(|v| **v == 1).count();
+    assert!(ones(&all) > ones(&none), "low_residual_threshold had no effect");
+}
+
+#[test]
+fn classify_lidar_rooftop_residual_threshold_is_a_setting() {
+    let none = classify_lidar_classes(
+        "wbtools_oss_classify_roof_none",
+        &[("rooftop_residual_threshold", json!(-1.0e9)), ("facade_threshold", json!(0.0))],
+    );
+    let all = classify_lidar_classes(
+        "wbtools_oss_classify_roof_all",
+        &[("rooftop_residual_threshold", json!(1.0e9)), ("facade_threshold", json!(0.0))],
+    );
+    let sixes = |c: &[u8]| c.iter().filter(|v| **v == 6).count();
+    assert!(sixes(&all) >= sixes(&none), "rooftop threshold reduced building points");
+    assert_ne!(all, none, "rooftop_residual_threshold had no effect");
+}

@@ -10123,6 +10123,9 @@ impl Tool for ClassifyLidarTool {
                 ToolParamSpec { name: "planarity_threshold", description: "Planarity threshold used in segmentation and refinement (default 0.85).", required: false, ..Default::default() },
                 ToolParamSpec { name: "num_iter", description: "Number of local RANSAC iterations for planarity/linearity estimates (default 30).", required: false, ..Default::default() },
                 ToolParamSpec { name: "facade_threshold", description: "Neighbor distance used when labeling building facades (default 0.5).", required: false, ..Default::default() },
+                ToolParamSpec { name: "rooftop_residual_threshold", description: "Height above ground below which unclustered points next to a building join it, in the cloud's z units (default 5.0, metres).", required: false, ..Default::default() },
+                ToolParamSpec { name: "low_residual_threshold", description: "Height above ground below which leftover vegetation points become unclassified, in the cloud's z units (default 2.0, metres).", required: false, ..Default::default() },
+                ToolParamSpec { name: "seed", description: "Seed for the RANSAC sampling, so the same input always gives the same classes (default 0).", required: false, ..Default::default() },
                 ToolParamSpec { name: "output", description: "Optional output LiDAR path.", required: false, ..Default::default() },
             ],
         }
@@ -10167,6 +10170,10 @@ impl Tool for ClassifyLidarTool {
             parse_f64_alias(args, &["planarity_threshold"], 0.85).clamp(0.0, 1.0);
         let num_iter = parse_f64_alias(args, &["num_iter"], 30.0).max(1.0) as usize;
         let facade_threshold = parse_f64_alias(args, &["facade_threshold"], 0.5).max(0.0);
+        let rooftop_residual_threshold =
+            parse_f64_alias(args, &["rooftop_residual_threshold"], 5.0);
+        let low_residual_threshold = parse_f64_alias(args, &["low_residual_threshold"], 2.0);
+        let seed = parse_f64_alias(args, &["seed"], 0.0).max(0.0) as u64;
         let output_path = parse_optional_lidar_output_path(args)?;
 
         let run_single = |in_path: &Path, out_path: Option<PathBuf>| -> Result<String, ToolError> {
@@ -10220,7 +10227,11 @@ impl Tool for ClassifyLidarTool {
                     }
 
                     let n = neigh.len();
-                    let mut rng = rand::rng();
+                    // One generator per point, seeded from the point index, so the result does not
+                    // depend on which thread takes which point.
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(
+                        seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    );
                     let mut max_planar_pts = 0usize;
                     let mut max_linear_pts = 0usize;
                     for _ in 0..num_iter {
@@ -10430,51 +10441,60 @@ impl Tool for ClassifyLidarTool {
             }
 
             // Stage 5: small above-ground planar clusters near ground get absorbed into ground.
+            // Each point reads only its own cluster and the fixed ground tree, so the decisions run
+            // in parallel and apply afterwards with the same result as the serial loop.
             if grd_cluster > 1 && ground_tree.size() > 0 {
-                for point_num in 0..n_points {
-                    let cluster_val = cluster[point_num];
-                    if cluster_val > 1 && cluster_val != grd_cluster {
+                let absorbed: Vec<usize> = (0..n_points)
+                    .into_par_iter()
+                    .filter(|&point_num| {
+                        let cluster_val = cluster[point_num];
+                        if cluster_val <= 1 || cluster_val == grd_cluster {
+                            return false;
+                        }
                         let p = cloud.points[point_num];
                         let neigh = ground_tree
                             .nearest(&[p.x, p.y], 10, &squared_euclidean)
                             .unwrap_or_default();
                         if neigh.is_empty() {
-                            continue;
+                            return false;
                         }
-                        let mut avg = 0.0;
-                        for (_, idx_ref) in &neigh {
-                            avg += cloud.points[**idx_ref].z;
-                        }
-                        avg /= neigh.len() as f64;
-                        if p.z - avg < oto_threshold {
-                            cluster[point_num] = grd_cluster;
-                        }
-                    }
+                        let avg = neigh.iter().map(|(_, idx)| cloud.points[**idx].z).sum::<f64>()
+                            / neigh.len() as f64;
+                        p.z - avg < oto_threshold
+                    })
+                    .collect();
+                for point_num in absorbed {
+                    cluster[point_num] = grd_cluster;
                 }
             }
 
             // Stage 6: building-facade capture.
             if facade_threshold > 0.0 {
                 let facade_sq = facade_threshold * facade_threshold;
-                let mut changes: Vec<(usize, usize)> = Vec::new();
-                for point_num in 0..n_points {
-                    if !point_is_withheld(&cloud.points[point_num])
-                        && cluster[point_num] > 1
-                        && cluster[point_num] != grd_cluster
-                    {
-                        let p = cloud.points[point_num];
-                        let found = tree
-                            .within(&[p.x, p.y], facade_sq, &squared_euclidean)
-                            .unwrap_or_default();
-                        for (_, idx_ref) in found {
+                // Collected in parallel; rayon keeps point order, so applying them in sequence
+                // lets the same change win as in the serial loop.
+                let pts = &cloud.points;
+                let changes: Vec<(usize, usize)> = (0..n_points)
+                    .into_par_iter()
+                    .flat_map_iter(|point_num| {
+                        let keep = !point_is_withheld(&pts[point_num])
+                            && cluster[point_num] > 1
+                            && cluster[point_num] != grd_cluster;
+                        let p = pts[point_num];
+                        let found = if keep {
+                            tree.within(&[p.x, p.y], facade_sq, &squared_euclidean)
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        let cluster = &cluster;
+                        found.into_iter().filter_map(move |(_, idx_ref)| {
                             let idx = *idx_ref;
-                            let p2 = cloud.points[idx];
-                            if cluster[idx] == 1 && p.z > p2.z {
-                                changes.push((idx, cluster[point_num]));
-                            }
-                        }
-                    }
-                }
+                            (cluster[idx] == 1 && p.z > pts[idx].z)
+                                .then_some((idx, cluster[point_num]))
+                        })
+                    })
+                    .collect();
                 for (idx, c) in changes {
                     cluster[idx] = c;
                 }
@@ -10482,29 +10502,32 @@ impl Tool for ClassifyLidarTool {
 
             // Stage 7: compute residuals for non-late points from nearest ground and reassign low-height rooftop clutter.
             if grd_cluster > 1 && ground_tree.size() > 0 {
-                for point_num in 0..n_points {
-                    if !active_late[point_num] && !point_is_withheld(&cloud.points[point_num]) {
+                // Each residual depends only on its own point and the fixed ground tree.
+                residuals
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(point_num, residual)| {
+                        if active_late[point_num] || point_is_withheld(&cloud.points[point_num]) {
+                            return;
+                        }
                         let p = cloud.points[point_num];
                         let neigh = ground_tree
                             .nearest(&[p.x, p.y], 10, &squared_euclidean)
                             .unwrap_or_default();
                         if neigh.is_empty() {
-                            continue;
+                            return;
                         }
-                        let mut avg = 0.0;
-                        for (_, idx_ref) in &neigh {
-                            avg += cloud.points[**idx_ref].z;
-                        }
-                        avg /= neigh.len() as f64;
-                        residuals[point_num] = p.z - avg;
-                    }
-                }
+                        let avg = neigh.iter().map(|(_, idx)| cloud.points[**idx].z).sum::<f64>()
+                            / neigh.len() as f64;
+                        *residual = p.z - avg;
+                    });
 
+                // Order-dependent: a point it relabels changes what later points see. Kept serial.
                 for point_num in 0..n_points {
                     if point_is_withheld(&cloud.points[point_num]) || cluster[point_num] != 1 {
                         continue;
                     }
-                    if residuals[point_num] < 5.0 {
+                    if residuals[point_num] < rooftop_residual_threshold {
                         let p = cloud.points[point_num];
                         let found = tree
                             .within(&[p.x, p.y], radius_sq, &squared_euclidean)
@@ -10531,15 +10554,16 @@ impl Tool for ClassifyLidarTool {
             // Stage 8: low/linear/planar vegetation becomes unclassified.
             cluster_num += 1;
             let unclassed_cluster = cluster_num;
-            for point_num in 0..n_points {
-                if cluster[point_num] == 1
-                    && (residuals[point_num] < 2.0
+            // Each point reads only its own values.
+            cluster.par_iter_mut().enumerate().for_each(|(point_num, c)| {
+                if *c == 1
+                    && (residuals[point_num] < low_residual_threshold
                         || planar[point_num] >= planarity_threshold
                         || linear[point_num] >= linearity_threshold)
                 {
-                    cluster[point_num] = unclassed_cluster;
+                    *c = unclassed_cluster;
                 }
-            }
+            });
 
             let points: Vec<PointRecord> = (0..n_points)
                 .into_par_iter()
